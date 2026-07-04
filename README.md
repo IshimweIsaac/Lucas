@@ -1,4 +1,4 @@
-# LUCAS -- Voice-Controlled AI Desktop Assistant
+# LUCAS : Voice-Controlled AI Desktop Assistant
 
 Real-time voice-controlled AI assistant for Linux. Maintains a persistent
 WebSocket connection to Google Gemini 3.1 Flash Live, streams audio and screen
@@ -6,7 +6,7 @@ video, and dispatches tool calls to 35+ action modules.
 
 42,724 lines of Python. 50 test files. Built by Isaac Ishimwe.
 
----
+:-
 
 ## Architecture
 
@@ -16,7 +16,7 @@ tool dispatch -> audio response (24kHz PCM) -> speaker.
 System prompt assembles context from 3-tier memory (long-term, session brief,
 conversation journal) plus screen state and heartbeat status.
 
----
+:-
 
 ## Capabilities
 
@@ -33,7 +33,7 @@ conversation journal) plus screen state and heartbeat status.
 - Telegram bot interface for remote control
 - Hot-reloader for live code updates
 
----
+:-
 
 ## Stack
 
@@ -51,6 +51,6 @@ conversation journal) plus screen state and heartbeat status.
 
 Cursor, Claude Code, Windsurf, OpenCode, VS Code, Git, pytest, Ruff
 
----
+:-
 
 github.com/IshimweIsaac/Lucas
