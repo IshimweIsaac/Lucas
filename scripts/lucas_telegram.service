@@ -1,0 +1,13 @@
+[Unit]
+Description=LUCAS Telegram Bot Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/Lucas
+ExecStart=/usr/bin/python3 telegram_bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

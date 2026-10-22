@@ -1,0 +1,353 @@
+import re
+import sys
+import threading
+import subprocess
+import tempfile
+import os
+import time
+from pathlib import Path
+from typing import Callable
+
+from agent.planner       import create_plan, replan
+from agent.error_handler import analyze_error, generate_fix, ErrorDecision
+import agent.tool_registry as tool_registry
+
+from core.logger import get_logger
+from memory.coding_model import get_coding_model, get_search_model
+from memory.model_router import generate_routed
+
+logger = get_logger(__name__)
+
+_CODING_GOAL_RE = re.compile(
+    r"\b("
+    r"code|coding|bug|fix|fixed|test|pytest|refactor|implement|patch|debug|"
+    r"function|class|module|import|error|exception|traceback|"
+    r"repo|repository|unittest|linter|ruff|syntax"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_coding_goal(text: str) -> bool:
+    return bool(text and _CODING_GOAL_RE.search(text))
+
+
+def _run_coding_workspace(goal: str, speak: Callable | None = None) -> str:
+    logger.info("[Executor] 🔀 Routing to coding_workspace")
+    return tool_registry.dispatch(
+        "coding_workspace",
+        {"action": "task", "goal": goal},
+        speak=speak,
+    )
+
+
+def _run_generated_code(description: str, speak: Callable | None = None) -> str:
+    # WARNING: This function executes arbitrary LLM-generated code.
+    # TODO(Phase 2): Implement sandboxing or a strict permission model.
+    if speak:
+        speak("Writing custom code for this task, sir.")
+
+    home      = Path.home()
+    desktop   = home / "Desktop"
+    downloads = home / "Downloads"
+    documents = home / "Documents"
+
+    if not desktop.exists():
+        try:
+            import winreg
+            key     = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+            desktop = Path(winreg.QueryValueEx(key, "Desktop")[0])
+        except Exception:
+            pass
+
+    system_instruction = (
+        "You are an expert Python developer. "
+        "Write clean, complete, working Python code. "
+        "Use standard library + common packages. "
+        "Install missing packages with subprocess + pip if needed. "
+        "Return ONLY the Python code. No explanation, no markdown, no backticks.\n\n"
+        f"SYSTEM PATHS:\n"
+        f"  Desktop   = r'{desktop}'\n"
+        f"  Downloads = r'{downloads}'\n"
+        f"  Documents = r'{documents}'\n"
+        f"  Home      = r'{home}'\n"
+    )
+
+    try:
+        code = generate_routed(
+            get_coding_model(),
+            f"Write Python code to accomplish this task:\n\n{description}",
+            system_instruction=system_instruction,
+        )
+        code = re.sub(r"```(?:python)?", "", code).strip().rstrip("`").strip()
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(code)
+            tmp_path = f.name
+
+        logger.info(f"[Executor] 🐍 Running generated code: {tmp_path}")
+
+        result = subprocess.run(
+            [sys.executable, tmp_path],
+            capture_output=True, text=True,
+            timeout=120, cwd=str(Path.home())
+        )
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        output = result.stdout.strip()
+        error  = result.stderr.strip()
+
+        if result.returncode == 0 and output:
+            return output
+        elif result.returncode == 0:
+            return "Task completed successfully."
+        elif error:
+            raise RuntimeError(f"Code error: {error[:400]}")
+        return "Completed."
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Generated code timed out after 120 seconds.")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Generated code failed: {e}")
+
+def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "") -> dict:
+    if not step_results:
+        return params
+
+    params = dict(params)
+
+    if tool == "file_controller" and params.get("action") in ("write", "create_file"):
+        content = params.get("content", "")
+        if not content or len(content) < 50:
+            all_results = [
+                v for v in step_results.values()
+                if v and len(v) > 100 and v not in ("Done.", "Completed.")
+            ]
+            if all_results:
+                combined = "\n\n---\n\n".join(all_results)
+                translated = _translate_to_goal_language(combined, goal)
+                params["content"] = translated
+                logger.info("[Executor] 💉 Injected + translated content")
+
+    return params
+def _detect_language(text: str) -> str:
+    try:
+        return generate_routed(
+            get_search_model(),
+            "What language is this text written in? "
+            "Reply with ONLY the language name in English (e.g. Turkish, English, French).\n\n"
+            f"Text: {text[:200]}",
+        )
+    except Exception:
+        return "English"
+
+
+def _translate_to_goal_language(content: str, goal: str) -> str:
+    if not goal:
+        return content
+    try:
+        target_lang = _detect_language(goal)
+        logger.info(f"[Executor] 🌐 Translating to: {target_lang}")
+
+        prompt = (
+            f"You are a professional translator. "
+            f"Translate the following text into {target_lang}.\n"
+            f"IMPORTANT:\n"
+            f"- Translate EVERYTHING, leave nothing in English\n"
+            f"- Keep all facts, numbers, and data intact\n"
+            f"- Keep the structure and formatting\n"
+            f"- Output ONLY the translated text, nothing else\n\n"
+            f"Text to translate:\n{content[:4000]}"
+        )
+        translated = generate_routed(get_search_model(), prompt)
+        logger.info(f"[Executor] ✅ Translation done ({target_lang})")
+        return translated
+    except Exception as e:
+        logger.warning(f"[Executor] ⚠️ Translation failed: {e}")
+        return content
+
+def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
+    if tool == "generated_code":
+        description = parameters.get("description", "") or parameters.get("goal", "")
+        if not description:
+            raise ValueError("generated_code requires a 'description' parameter.")
+        if _is_coding_goal(description):
+            return _run_coding_workspace(description, speak=speak)
+        return _run_generated_code(description, speak=speak)
+
+    elif tool_registry.has_tool(tool):
+        try:
+            res = tool_registry.dispatch(tool, parameters=parameters, player=None, speak=speak)
+            return res or "Done."
+        except Exception as e:
+            return f"Tool error: {e}"
+
+    else:
+        fallback_text = parameters.get("description", "") or parameters.get("goal", "") or str(parameters)
+        if _is_coding_goal(fallback_text):
+            logger.warning(f"[Executor] ⚠️ Unknown tool '{tool}' — using coding_workspace")
+            return _run_coding_workspace(fallback_text, speak=speak)
+        logger.warning(f"[Executor] ⚠️ Unknown tool '{tool}' — falling back to generated_code")
+        return _run_generated_code(f"Accomplish this task: {parameters}", speak=speak)
+
+class AgentExecutor:
+
+    MAX_REPLAN_ATTEMPTS = 2
+
+    def execute(
+        self,
+        goal:        str,
+        speak:       Callable | None        = None,
+        cancel_flag: threading.Event | None = None,
+    ) -> str:
+        logger.info(f"\\n[Executor] 🎯 Goal: {goal}")
+
+        replan_attempts = 0
+        completed_steps = []
+        step_results    = {} 
+        plan            = create_plan(goal)
+
+        while True:
+            steps = plan.get("steps", [])
+
+            if not steps:
+                msg = "I couldn't create a valid plan for this task, sir."
+                if speak:
+                    speak(msg)
+                return msg
+
+            success      = True
+            failed_step  = None
+            failed_error = ""
+
+            for step in steps:
+                if cancel_flag and cancel_flag.is_set():
+                    if speak:
+                        speak("Task cancelled, sir.")
+                    return "Task cancelled."
+
+                step_num = step.get("step", "?")
+                tool     = step.get("tool", "generated_code")
+                desc     = step.get("description", "")
+                params   = step.get("parameters", {})
+
+                params = _inject_context(params, tool, step_results, goal=goal)
+
+                logger.info(f"\\n[Executor] ▶️ Step {step_num}: [{tool}] {desc}")
+
+                attempt = 1
+                step_ok = False
+
+                while attempt <= 3:
+                    if cancel_flag and cancel_flag.is_set():
+                        break
+                    try:
+                        result = _call_tool(tool, params, speak)
+                        step_results[step_num] = result 
+                        completed_steps.append(step)
+                        logger.info(f"[Executor] ✅ Step {step_num} done: {str(result)[:100]}")
+                        step_ok = True
+                        break
+
+                    except Exception as e:
+                        error_msg = str(e)
+                        logger.error(f"[Executor] ❌ Step {step_num} attempt {attempt} failed: {error_msg}")
+
+                        recovery = analyze_error(step, error_msg, attempt=attempt)
+                        decision = recovery["decision"]
+                        user_msg = recovery.get("user_message", "")
+
+                        if speak and user_msg:
+                            speak(user_msg)
+
+                        if decision == ErrorDecision.RETRY:
+                            attempt += 1
+                            time.sleep(2)
+                            continue
+
+                        elif decision == ErrorDecision.SKIP:
+                            logger.info(f"[Executor] ⏭️ Skipping step {step_num}")
+                            completed_steps.append(step)
+                            step_ok = True
+                            break
+
+                        elif decision == ErrorDecision.ABORT:
+                            msg = f"Task aborted, sir. {recovery.get('reason', '')}"
+                            if speak:
+                                speak(msg)
+                            return msg
+
+                        else: 
+                            fix_suggestion = recovery.get("fix_suggestion", "")
+                            if fix_suggestion and tool != "generated_code":
+                                try:
+                                    fixed_step = generate_fix(step, error_msg, fix_suggestion)
+                                    if speak:
+                                        speak("Trying an alternative approach, sir.")
+                                    res = _call_tool(
+                                        fixed_step["tool"],
+                                        fixed_step["parameters"],
+                                        speak
+                                    )
+                                    step_results[step_num] = res
+                                    completed_steps.append(step)
+                                    step_ok = True
+                                    break
+                                except Exception as fix_err:
+                                    logger.warning(f"[Executor] ⚠️ Fix failed: {fix_err}")
+
+                            failed_step  = step
+                            failed_error = error_msg
+                            success      = False
+                            break
+
+                if not step_ok and not failed_step:
+                    failed_step  = step
+                    failed_error = "Max retries exceeded"
+                    success      = False
+
+                if not success:
+                    break
+
+            if success:
+                return self._summarize(goal, completed_steps, speak)
+
+            if replan_attempts >= self.MAX_REPLAN_ATTEMPTS:
+                msg = f"Task failed after {replan_attempts} replan attempts, sir."
+                if speak:
+                    speak(msg)
+                return msg
+
+            if speak:
+                speak("Adjusting my approach, sir.")
+
+            replan_attempts += 1
+            plan = replan(goal, completed_steps, failed_step, failed_error)
+
+    def _summarize(self, goal: str, completed_steps: list, speak: Callable | None) -> str:
+        fallback = f"All done, sir. Completed {len(completed_steps)} steps for: {goal[:60]}."
+        try:
+            steps_str = "\n".join(f"- {s.get('description', '')}" for s in completed_steps)
+            prompt    = (
+                f'User goal: "{goal}"\n'
+                f"Completed steps:\n{steps_str}\n\n"
+                "Write a single natural sentence summarizing what was accomplished. "
+                "Address the user as 'sir'. Be direct and positive."
+            )
+            summary = generate_routed(get_search_model(), prompt)
+            if speak:
+                speak(summary)
+            return summary
+        except Exception:
+            if speak:
+                speak(fallback)
+            return fallback

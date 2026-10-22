@@ -1,0 +1,67 @@
+# Lucas Assistant Ignores
+config/api_keys.json
+config/agent_keys.json
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+node_modules/
+target/
+.DS_Store
+*.log
+.aider*
+
+# Runtime state files (generated, never committed)
+memory/.backups/
+memory/plans/
+memory/swarm_jobs/*.json
+memory/swarm_jobs/*.md
+memory/project_briefs/
+memory/learning/
+memory/lucas_eval/
+memory/conversation_journal.json
+memory/heartbeat.json
+memory/session_brief.json
+memory/opencode_live.json
+memory/presentation_live.json
+memory/work_plan.json
+memory/project_store.json
+memory/daily_todo_store.json
+memory/document_preview.json
+
+# Generated cache dirs
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+__pycache__/
+
+# Build artifacts
+dist/
+dist-electron/
+*.tsbuildinfo
+
+# User data
+notes/
+logs/
+static/
+Lucas notes/
+
+# IDE
+.vscode/
+.idea/
+
+# Generated reports
+SPEC.md
+KNOWLEDGE.md
+
+# Independent subsystems (separate git repos)
+lucas_ui/
+.opencode/
+
+# Runtime state (untrack after cleanup purge)
+memory/agent_history.json
+memory/aider_history.json
+memory/project_registry.json
+memory/swarm_challenge/
